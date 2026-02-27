@@ -12,6 +12,21 @@ export function renderRegisterPageHTML(jwtState: JwtSecretState | null): string 
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NodeWarden</title>
+  <script>
+    (function () {
+      try {
+        const hash = window.location.hash || '';
+        const match = hash.match(/^#\/send\/([^/]+)\/([^/]+)\/?$/i);
+        if (!match) return;
+
+        const accessId = encodeURIComponent(match[1]);
+        const urlB64Key = encodeURIComponent(match[2]);
+        window.location.replace('/send/' + accessId + '/' + urlB64Key);
+      } catch {
+        // noop
+      }
+    })();
+  </script>
   <style>
     :root {
       color-scheme: light;

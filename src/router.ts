@@ -54,6 +54,7 @@ import { handleSync } from './handlers/sync';
 // Setup handlers
 import { handleSetupPage, handleSetupStatus } from './handlers/setup';
 import { handleKnownDevice, handleGetDevices, handleUpdateDeviceToken } from './handlers/devices';
+import { handlePublicSendPage } from './handlers/send-public';
 
 // Import handler
 import { handleCiphersImport } from './handlers/import';
@@ -184,6 +185,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // Setup page (root)
     if (path === '/' && method === 'GET') {
       return handleSetupPage(request, env);
+    }
+
+    // Public Send page (recipient-facing)
+    const publicSendPageMatch = path.match(/^\/send\/([^/]+)\/([^/]+)\/?$/i);
+    if (publicSendPageMatch && method === 'GET') {
+      const accessId = decodeURIComponent(publicSendPageMatch[1]);
+      const urlB64Key = decodeURIComponent(publicSendPageMatch[2]);
+      return handlePublicSendPage(request, env, accessId, urlB64Key);
     }
 
     // Setup status
