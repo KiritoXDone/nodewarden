@@ -12,10 +12,11 @@ import { generateUUID } from '../utils/uuid';
 import { issueSendAccessToken } from './sends';
 import {
   buildYubikeyProviderData,
-  extractYubikeyPublicId,
   normalizeYubikeyKeys,
-  verifyYubikeyOtpWithYubico,
 } from '../utils/yubikey';
+import {
+  verifyRegisteredYubikeyOtp,
+} from '../services/account-two-factor';
 import {
   buildAccountKeys,
   buildUserDecryptionOptions,
@@ -313,30 +314,16 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
 
-        const yubikeyOtp = normalizedTwoFactorToken.toLowerCase();
-        const yubikeyPublicId = extractYubikeyPublicId(yubikeyOtp);
-        if (!yubikeyPublicId || !configuredYubikeyPublicIds.includes(yubikeyPublicId)) {
-          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
-        }
-        if (await storage.isYubikeyOtpAlreadyUsed(yubikeyOtp)) {
-          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
-        }
-        const clientId = String(env.YUBICO_CLIENT_ID || '').trim();
-        const secretKey = String(env.YUBICO_SECRET_KEY || '').trim();
-        if (!clientId || !secretKey) {
+        const verified = await verifyRegisteredYubikeyOtp({
+          otp: normalizedTwoFactorToken,
+          config: { keys: configuredYubikeyPublicIds, nfc: !!user.yubikeyOtpNfc },
+          env,
+          markOtpUsed: async (candidate) => storage.markYubikeyOtpUsed(candidate),
+        });
+        if (verified.status === 'not_configured') {
           return identityErrorResponse('YubiKey OTP is not configured on server', 'invalid_grant', 400);
         }
-        const verified = await verifyYubikeyOtpWithYubico(yubikeyOtp, {
-          clientId,
-          secretKey,
-          apiUrl: env.YUBICO_API_URL,
-          server: env.YUBICO_SERVER,
-        });
-        if (!verified.ok || verified.publicId !== yubikeyPublicId) {
-          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
-        }
-        const marked = await storage.markYubikeyOtpUsed(yubikeyOtp);
-        if (!marked) {
+        if (!verified.ok) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
       } else if (

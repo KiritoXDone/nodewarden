@@ -98,6 +98,7 @@ export function normalizeYubikeyKeys(input: unknown, maxKeys: number = MAX_YUBIK
   return normalized;
 }
 
+
 export function parseStoredYubikeyOtpConfig(input: unknown): StoredYubikeyOtpConfig {
   if (typeof input !== 'string' || !input.trim()) {
     return { keys: [], nfc: false };

@@ -614,14 +614,6 @@ export class StorageService {
     return findStoredTrustedTokenUserId(this.db, this.trustedTwoFactorTokenKey.bind(this), token, deviceIdentifier);
   }
 
-  async isYubikeyOtpAlreadyUsed(otp: string): Promise<boolean> {
-    const now = Date.now();
-    await this.maybeCleanupUsedYubikeyOtps(now);
-    const digest = await this.sha256Hex(otp);
-    const row = await this.db.prepare('SELECT otp_hash FROM used_yubikey_otps WHERE otp_hash = ?').bind(`sha256:${digest}`).first<{ otp_hash: string }>();
-    return !!row?.otp_hash;
-  }
-
   async markYubikeyOtpUsed(otp: string): Promise<boolean> {
     const now = Date.now();
     await this.maybeCleanupUsedYubikeyOtps(now);

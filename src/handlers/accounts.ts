@@ -14,8 +14,18 @@ import {
   isValidYubikeyPublicId,
   normalizeYubikeyKeys,
   normalizeYubikeyPublicId,
-  verifyYubikeyOtpWithYubico,
 } from '../utils/yubikey';
+import {
+  applyBoundYubikey,
+  applyRemovedYubikey,
+  buildVaultwardenYubikeyStatus,
+  buildWebYubikeyStatus,
+  getYubicoVerifyOptions,
+  parseVaultwardenYubikeySlots,
+  shouldKeepRecoveryCode,
+  verifyProtectedTwoFactorAccess,
+  verifyRegisteredYubikeyOtp,
+} from '../services/account-two-factor';
 
 function looksLikeEncString(value: string): boolean {
   if (!value) return false;
@@ -99,31 +109,6 @@ function clearYubikeyConfig(user: User): void {
   user.yubikeyOtpNfc = false;
 }
 
-function buildVaultwardenYubikeyResponse(user: User): Record<string, unknown> {
-  const keys = getYubikeyKeys(user);
-  const response: Record<string, unknown> = {
-    Enabled: keys.length > 0,
-    Nfc: keys.length > 0 ? !!user.yubikeyOtpNfc : false,
-    object: 'twoFactorU2f',
-  };
-  keys.slice(0, MAX_YUBIKEY_KEYS).forEach((key, index) => {
-    response[`Key${index + 1}`] = key;
-  });
-  return response;
-}
-
-function getYubicoVerifyOptions(env: Env): { clientId: string; secretKey: string; apiUrl?: string; server?: string } | null {
-  const clientId = String(env.YUBICO_CLIENT_ID || '').trim();
-  const secretKey = String(env.YUBICO_SECRET_KEY || '').trim();
-  if (!clientId || !secretKey) return null;
-  return {
-    clientId,
-    secretKey,
-    apiUrl: String(env.YUBICO_API_URL || '').trim() || undefined,
-    server: String(env.YUBICO_SERVER || '').trim() || undefined,
-  };
-}
-
 async function readRequestBodyMap(request: Request): Promise<Record<string, unknown>> {
   const contentType = request.headers.get('content-type') || '';
   if (
@@ -143,49 +128,29 @@ async function verifyPasswordOrOtp(
   env: Env,
   body: Record<string, unknown>
 ): Promise<boolean> {
-  const masterPasswordHash = String(
-    body.masterPasswordHash ||
-    body.master_password_hash ||
-    body.password ||
-    ''
-  ).trim();
-  if (masterPasswordHash) {
-    const validPassword = await auth.verifyPassword(masterPasswordHash, user.masterPasswordHash, user.email);
-    if (validPassword) return true;
-  }
-
-  const otp = String(body.otp || body.Otp || body.twoFactorToken || '').trim();
-  if (!otp) return false;
-
-  if (user.totpSecret && isTotpEnabled(user.totpSecret)) {
-    const validTotp = await verifyTotpToken(user.totpSecret, otp);
-    if (validTotp) return true;
-  }
-
-  if (recoveryCodeEquals(otp, user.totpRecoveryCode)) {
-    return true;
-  }
-
-  const configuredKeys = getYubikeyKeys(user);
-  if (!configuredKeys.length) return false;
-
-  const yubikeyOtp = otp.toLowerCase();
-  const yubikeyPublicId = extractYubikeyPublicId(yubikeyOtp);
-  if (!yubikeyPublicId || !configuredKeys.includes(yubikeyPublicId)) {
-    return false;
-  }
-  if (await storage.isYubikeyOtpAlreadyUsed(yubikeyOtp)) {
-    return false;
-  }
-
-  const yubicoOptions = getYubicoVerifyOptions(env);
-  if (!yubicoOptions) return false;
-
-  const verified = await verifyYubikeyOtpWithYubico(yubikeyOtp, yubicoOptions);
-  if (!verified.ok || verified.publicId !== yubikeyPublicId) {
-    return false;
-  }
-  return storage.markYubikeyOtpUsed(yubikeyOtp);
+  return verifyProtectedTwoFactorAccess({
+    masterPasswordHash: String(body.masterPasswordHash || body.master_password_hash || body.password || '').trim() || null,
+    otp: String(body.otp || body.Otp || body.twoFactorToken || '').trim() || null,
+    user: {
+      email: user.email,
+      masterPasswordHash: user.masterPasswordHash,
+      totpSecret: user.totpSecret,
+      totpRecoveryCode: user.totpRecoveryCode,
+    },
+    verifyPassword: auth.verifyPassword.bind(auth),
+    verifyTotp: verifyTotpToken,
+    verifyYubikeyOtp: async (otp) => {
+      const publicId = extractYubikeyPublicId(otp);
+      if (!publicId) return { ok: false };
+      const verified = await verifyRegisteredYubikeyOtp({
+        otp,
+        config: { keys: getYubikeyKeys(user), nfc: !!user.yubikeyOtpNfc },
+        env,
+        markOtpUsed: async (candidate) => storage.markYubikeyOtpUsed(candidate),
+      });
+      return { ok: verified.ok };
+    },
+  });
 }
 
 async function normalizeSubmittedYubikeyKeys(
@@ -193,16 +158,8 @@ async function normalizeSubmittedYubikeyKeys(
   env: Env,
   body: Record<string, unknown>
 ): Promise<{ ok: true; keys: string[] } | { ok: false; message: string }> {
-  const yubicoOptions = getYubicoVerifyOptions(env);
-  if (!yubicoOptions) {
-    return { ok: false, message: 'YubiKey OTP is not configured on server' };
-  }
-
   const resolvedKeys: string[] = [];
-  for (let index = 1; index <= MAX_YUBIKEY_KEYS; index++) {
-    const raw = String(body[`Key${index}`] || body[`key${index}`] || '').trim().toLowerCase();
-    if (!raw) continue;
-
+  for (const raw of parseVaultwardenYubikeySlots(body)) {
     if (raw.length === 12 && isValidYubikeyPublicId(raw)) {
       resolvedKeys.push(raw);
       continue;
@@ -212,20 +169,27 @@ async function normalizeSubmittedYubikeyKeys(
     if (!publicId) {
       return { ok: false, message: 'Invalid YubiKey OTP' };
     }
-    if (await storage.isYubikeyOtpAlreadyUsed(raw)) {
-      return { ok: false, message: 'YubiKey OTP was already used' };
-    }
 
-    const verified = await verifyYubikeyOtpWithYubico(raw, yubicoOptions);
-    if (!verified.ok || verified.publicId !== publicId) {
+    const verified = await verifyRegisteredYubikeyOtp({
+      otp: raw,
+      config: { keys: [publicId], nfc: false },
+      env,
+      markOtpUsed: async (candidate) => storage.markYubikeyOtpUsed(candidate),
+    });
+    if (!verified.ok || !verified.publicId) {
+      if (verified.status === 'not_configured') {
+        return { ok: false, message: 'YubiKey OTP is not configured on server' };
+      }
+      if (verified.status === 'replayed_otp') {
+        return { ok: false, message: 'YubiKey OTP was already used' };
+      }
+      if (verified.status === 'invalid_format') {
+        return { ok: false, message: 'Invalid YubiKey OTP' };
+      }
       return { ok: false, message: `Invalid YubiKey OTP (${verified.status})` };
     }
-    const marked = await storage.markYubikeyOtpUsed(raw);
-    if (!marked) {
-      return { ok: false, message: 'YubiKey OTP was already used' };
-    }
 
-    resolvedKeys.push(publicId);
+    resolvedKeys.push(verified.publicId);
   }
 
   return { ok: true, keys: normalizeYubikeyKeys(resolvedKeys) };
@@ -758,7 +722,8 @@ export async function handleSetTotpStatus(request: Request, env: Env, userId: st
     if (!valid) return errorResponse('Invalid password', 400);
 
     user.totpSecret = null;
-    if (!hasYubikeyConfigured(user)) {
+    const nextConfig = { keys: getYubikeyKeys(user), nfc: !!user.yubikeyOtpNfc };
+    if (!shouldKeepRecoveryCode(user, nextConfig)) {
       user.totpRecoveryCode = null;
     }
     user.updatedAt = new Date().toISOString();
@@ -776,14 +741,7 @@ export async function handleGetYubikeyStatus(request: Request, env: Env, userId:
   const storage = new StorageService(env.DB);
   const user = await storage.getUserById(userId);
   if (!user) return errorResponse('User not found', 404);
-  const publicIds = getYubikeyKeys(user);
-  return jsonResponse({
-    enabled: publicIds.length > 0,
-    publicIds,
-    keys: publicIds,
-    nfc: publicIds.length > 0 ? !!user.yubikeyOtpNfc : false,
-    object: 'twoFactorYubikey',
-  });
+  return jsonResponse(buildWebYubikeyStatus({ keys: getYubikeyKeys(user), nfc: !!user.yubikeyOtpNfc }));
 }
 
 // POST /api/two-factor/get-yubikey
@@ -808,7 +766,7 @@ export async function handleGetVaultwardenYubikeyStatus(request: Request, env: E
     return errorResponse('User verification failed.', 400);
   }
 
-  return jsonResponse(buildVaultwardenYubikeyResponse(user));
+  return jsonResponse(buildVaultwardenYubikeyStatus({ keys: getYubikeyKeys(user), nfc: !!user.yubikeyOtpNfc }));
 }
 
 // PUT /api/accounts/yubikey
@@ -830,44 +788,40 @@ export async function handleSetYubikeyStatus(request: Request, env: Env, userId:
 
   if (body.enabled === true) {
     const otp = String(body.otp || '').trim().toLowerCase();
-    const yubicoOptions = getYubicoVerifyOptions(env);
-    if (!yubicoOptions) return errorResponse('YubiKey OTP is not configured on server', 400);
     if (!otp) return errorResponse('YubiKey OTP is required', 400);
 
-    if (await storage.isYubikeyOtpAlreadyUsed(otp)) {
-      return errorResponse('YubiKey OTP was already used', 400);
-    }
+    const publicId = extractYubikeyPublicId(otp);
+    if (!publicId) return errorResponse('Invalid YubiKey OTP', 400);
 
-    const verified = await verifyYubikeyOtpWithYubico(otp, yubicoOptions);
+    const verified = await verifyRegisteredYubikeyOtp({
+      otp,
+      config: { keys: [publicId], nfc: !!user.yubikeyOtpNfc },
+      env,
+      markOtpUsed: async (candidate) => storage.markYubikeyOtpUsed(candidate),
+    });
     if (!verified.ok || !verified.publicId) {
+      if (verified.status === 'not_configured') return errorResponse('YubiKey OTP is not configured on server', 400);
+      if (verified.status === 'replayed_otp') return errorResponse('YubiKey OTP was already used', 400);
+      if (verified.status === 'invalid_format') return errorResponse('Invalid YubiKey OTP', 400);
       return errorResponse(`Invalid YubiKey OTP (${verified.status})`, 400);
     }
-
-    const marked = await storage.markYubikeyOtpUsed(otp);
-    if (!marked) return errorResponse('YubiKey OTP was already used', 400);
 
     const currentIds = getYubikeyKeys(user);
     if (!currentIds.includes(verified.publicId) && currentIds.length >= MAX_YUBIKEY_KEYS) {
       return errorResponse(`You can only register up to ${MAX_YUBIKEY_KEYS} YubiKeys`, 400);
     }
-    const nextIds = normalizeYubikeyKeys([...currentIds, verified.publicId]);
     const nextNfc = Object.prototype.hasOwnProperty.call(body, 'nfc')
       ? normalizeYubikeyNfc((body as Record<string, unknown>).nfc)
       : !!user.yubikeyOtpNfc;
-    setYubikeyConfig(user, nextIds, nextNfc);
+    const nextConfig = applyBoundYubikey({ keys: currentIds, nfc: !!user.yubikeyOtpNfc }, verified.publicId, nextNfc);
+    setYubikeyConfig(user, nextConfig.keys, nextConfig.nfc);
     if (!user.totpRecoveryCode) {
       user.totpRecoveryCode = createRecoveryCode();
     }
     user.updatedAt = new Date().toISOString();
     await storage.saveUser(user);
     await storage.deleteRefreshTokensByUserId(user.id);
-    return jsonResponse({
-      enabled: true,
-      publicIds: nextIds,
-      keys: nextIds,
-      nfc: nextIds.length > 0 ? !!user.yubikeyOtpNfc : false,
-      object: 'twoFactorYubikey',
-    });
+    return jsonResponse(buildWebYubikeyStatus(nextConfig));
   }
 
   const removePublicId = normalizeYubikeyPublicId(body.removePublicId || '');
@@ -877,22 +831,15 @@ export async function handleSetYubikeyStatus(request: Request, env: Env, userId:
     }
     const valid = await auth.verifyPassword(body.masterPasswordHash, user.masterPasswordHash, user.email);
     if (!valid) return errorResponse('Invalid password', 400);
-    const currentIds = getYubikeyKeys(user);
-    const nextIds = currentIds.filter((id) => id !== removePublicId);
-    setYubikeyConfig(user, nextIds, user.yubikeyOtpNfc);
-    if (!hasYubikeyConfigured(user) && !user.totpSecret) {
+    const nextConfig = applyRemovedYubikey({ keys: getYubikeyKeys(user), nfc: !!user.yubikeyOtpNfc }, removePublicId);
+    setYubikeyConfig(user, nextConfig.keys, nextConfig.nfc);
+    if (!shouldKeepRecoveryCode(user, nextConfig)) {
       user.totpRecoveryCode = null;
     }
     user.updatedAt = new Date().toISOString();
     await storage.saveUser(user);
     await storage.deleteRefreshTokensByUserId(user.id);
-    return jsonResponse({
-      enabled: nextIds.length > 0,
-      publicIds: nextIds,
-      keys: nextIds,
-      nfc: nextIds.length > 0 ? !!user.yubikeyOtpNfc : false,
-      object: 'twoFactorYubikey',
-    });
+    return jsonResponse(buildWebYubikeyStatus(nextConfig));
   }
 
   if (body.enabled === false) {
@@ -901,14 +848,15 @@ export async function handleSetYubikeyStatus(request: Request, env: Env, userId:
     }
     const valid = await auth.verifyPassword(body.masterPasswordHash, user.masterPasswordHash, user.email);
     if (!valid) return errorResponse('Invalid password', 400);
+    const nextConfig = { keys: [], nfc: false };
     clearYubikeyConfig(user);
-    if (!user.totpSecret) {
+    if (!shouldKeepRecoveryCode(user, nextConfig)) {
       user.totpRecoveryCode = null;
     }
     user.updatedAt = new Date().toISOString();
     await storage.saveUser(user);
     await storage.deleteRefreshTokensByUserId(user.id);
-    return jsonResponse({ enabled: false, publicIds: [], keys: [], nfc: false, object: 'twoFactorYubikey' });
+    return jsonResponse(buildWebYubikeyStatus(nextConfig));
   }
 
   return errorResponse('enabled must be true or false', 400);
@@ -940,22 +888,31 @@ export async function handleSetVaultwardenYubikeyStatus(request: Request, env: E
   if (!normalizedKeys.ok) {
     return errorResponse(normalizedKeys.message, 400);
   }
+
   if (!normalizedKeys.keys.length) {
-    return jsonResponse({
-      Enabled: false,
-      Nfc: false,
-      object: 'twoFactorU2f',
-    });
+    const nextConfig = { keys: [], nfc: false };
+    clearYubikeyConfig(user);
+    if (!shouldKeepRecoveryCode(user, nextConfig)) {
+      user.totpRecoveryCode = null;
+    }
+    user.updatedAt = new Date().toISOString();
+    await storage.saveUser(user);
+    await storage.deleteRefreshTokensByUserId(user.id);
+    return jsonResponse(buildVaultwardenYubikeyStatus(nextConfig));
   }
 
-  setYubikeyConfig(user, normalizedKeys.keys, normalizeYubikeyNfc(body.Nfc ?? body.nfc));
+  const nextConfig = {
+    keys: normalizedKeys.keys,
+    nfc: normalizeYubikeyNfc(body.Nfc ?? body.nfc),
+  };
+  setYubikeyConfig(user, nextConfig.keys, nextConfig.nfc);
   if (!user.totpRecoveryCode) {
     user.totpRecoveryCode = createRecoveryCode();
   }
   user.updatedAt = new Date().toISOString();
   await storage.saveUser(user);
   await storage.deleteRefreshTokensByUserId(user.id);
-  return jsonResponse(buildVaultwardenYubikeyResponse(user));
+  return jsonResponse(buildVaultwardenYubikeyStatus(nextConfig));
 }
 
 // POST /api/accounts/totp/recovery-code
@@ -982,7 +939,7 @@ export async function handleGetTotpRecoveryCode(request: Request, env: Env, user
   if (!currentHash) return errorResponse('masterPasswordHash is required', 400);
   const valid = await auth.verifyPassword(currentHash, user.masterPasswordHash, user.email);
   if (!valid) return errorResponse('Invalid password', 400);
-  if (!user.totpSecret && !hasYubikeyConfigured(user)) {
+  if (!user.totpSecret && !getYubikeyKeys(user).length) {
     return errorResponse('Two-step login is not enabled', 400);
   }
 
