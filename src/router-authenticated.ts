@@ -11,6 +11,10 @@ import {
   handleGetTotpStatus,
   handleSetTotpStatus,
   handleGetTotpRecoveryCode,
+  handleGetYubikeyStatus,
+  handleGetVaultwardenYubikeyStatus,
+  handleSetYubikeyStatus,
+  handleSetVaultwardenYubikeyStatus,
 } from './handlers/accounts';
 import {
   handleGetCiphers,
@@ -105,6 +109,20 @@ export async function handleAuthenticatedRoute(
 
   if ((path === '/api/accounts/totp/recovery-code' || path === '/api/two-factor/get-recover') && method === 'POST') {
     return handleGetTotpRecoveryCode(request, env, userId);
+  }
+
+  if (path === '/api/accounts/yubikey') {
+    if (method === 'GET') return handleGetYubikeyStatus(request, env, userId);
+    if (method === 'PUT' || method === 'POST') return handleSetYubikeyStatus(request, env, userId);
+    return null;
+  }
+
+  if (path === '/api/two-factor/get-yubikey' && method === 'POST') {
+    return handleGetVaultwardenYubikeyStatus(request, env, userId);
+  }
+
+  if (path === '/api/two-factor/yubikey' && (method === 'POST' || method === 'PUT')) {
+    return handleSetVaultwardenYubikeyStatus(request, env, userId);
   }
 
   if (path === '/api/accounts/revision-date' && method === 'GET') {

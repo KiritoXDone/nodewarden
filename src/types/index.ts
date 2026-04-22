@@ -11,10 +11,19 @@ export interface Env {
   ATTACHMENTS_KV?: KVNamespace;
   JWT_SECRET: string;
   TOTP_SECRET?: string;
+  YUBICO_CLIENT_ID?: string;
+  YUBICO_SECRET_KEY?: string;
+  YUBICO_API_URL?: string;
+  YUBICO_SERVER?: string;
 }
 
 export type UserRole = 'admin' | 'user';
 export type UserStatus = 'active' | 'banned';
+
+export interface YubikeyOtpConfig {
+  keys: string[];
+  nfc: boolean;
+}
 
 // Sample JWT secret used by `.dev.vars.example`.
 // If runtime JWT_SECRET equals this value, treat it as unsafe.
@@ -50,6 +59,8 @@ export interface User {
   verifyDevices?: boolean;
   totpSecret: string | null;
   totpRecoveryCode: string | null;
+  yubikeyOtpKeys: string[] | null;
+  yubikeyOtpNfc: boolean;
   createdAt: string;
   updatedAt: string;
 }
