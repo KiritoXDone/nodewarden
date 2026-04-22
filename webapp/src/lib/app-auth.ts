@@ -17,6 +17,10 @@ export interface PendingTotp {
   email: string;
   passwordHash: string;
   masterKey: Uint8Array;
+  // 0 = authenticator(TOTP), 3 = YubiKey OTP.
+  availableProviders: Array<'0' | '3'>;
+  // 0 = authenticator(TOTP), 3 = YubiKey OTP.
+  preferredProvider: '0' | '3';
 }
 
 export type JwtUnsafeReason = 'missing' | 'default' | 'too_short';
@@ -24,6 +28,7 @@ export type JwtUnsafeReason = 'missing' | 'default' | 'too_short';
 export interface BootstrapAppResult {
   defaultKdfIterations: number;
   jwtWarning: { reason: JwtUnsafeReason; minLength: number } | null;
+  yubikeyOtpConfigured: boolean;
   session: SessionState | null;
   profile: Profile | null;
   phase: AppPhase;
@@ -33,6 +38,7 @@ export interface BootstrapAppResult {
 export interface InitialAppBootstrapState {
   defaultKdfIterations: number;
   jwtWarning: { reason: JwtUnsafeReason; minLength: number } | null;
+  yubikeyOtpConfigured: boolean;
   session: SessionState | null;
   phase: AppPhase;
 }
@@ -45,7 +51,7 @@ export interface CompletedLogin {
 
 export type PasswordLoginResult =
   | { kind: 'success'; login: CompletedLogin }
-  | { kind: 'totp'; pendingTotp: PendingTotp }
+  | { kind: 'twoFactor'; pendingTotp: PendingTotp }
   | { kind: 'error'; message: string };
 
 export interface RecoverTwoFactorResult {
@@ -96,7 +102,9 @@ function readWindowBootstrap(): WebBootstrapResponse {
   return raw && typeof raw === 'object' ? raw : {};
 }
 
-function normalizeBootstrapResponse(boot: WebBootstrapResponse): Pick<InitialAppBootstrapState, 'defaultKdfIterations' | 'jwtWarning'> {
+function normalizeBootstrapResponse(
+  boot: WebBootstrapResponse
+): Pick<InitialAppBootstrapState, 'defaultKdfIterations' | 'jwtWarning' | 'yubikeyOtpConfigured'> {
   const defaultKdfIterations = Number(boot.defaultKdfIterations || 600000);
   const jwtUnsafeReason = boot.jwtUnsafeReason || null;
   const jwtWarning = jwtUnsafeReason
@@ -109,6 +117,7 @@ function normalizeBootstrapResponse(boot: WebBootstrapResponse): Pick<InitialApp
   return {
     defaultKdfIterations,
     jwtWarning,
+    yubikeyOtpConfigured: !!boot.yubikeyOtpConfigured,
   };
 }
 
@@ -162,13 +171,14 @@ function buildTransientProfile(token: TokenSuccess, email: string): Profile {
 }
 
 export function readInitialAppBootstrapState(): InitialAppBootstrapState {
-  const { defaultKdfIterations, jwtWarning } = normalizeBootstrapResponse(readWindowBootstrap());
+  const { defaultKdfIterations, jwtWarning, yubikeyOtpConfigured } = normalizeBootstrapResponse(readWindowBootstrap());
   const session = loadSession();
   const hasInviteCode = !!readInviteCodeFromUrl();
 
   return {
     defaultKdfIterations,
     jwtWarning,
+    yubikeyOtpConfigured,
     session,
     phase: jwtWarning ? 'login' : session ? 'locked' : hasInviteCode ? 'register' : 'login',
   };
@@ -179,11 +189,13 @@ export async function bootstrapAppSession(initial: InitialAppBootstrapState = re
   const normalizedBoot = normalizeBootstrapResponse(remoteBoot);
   const defaultKdfIterations = normalizedBoot.defaultKdfIterations || initial.defaultKdfIterations;
   const jwtWarning = normalizedBoot.jwtWarning ?? initial.jwtWarning;
+  const yubikeyOtpConfigured = normalizedBoot.yubikeyOtpConfigured ?? initial.yubikeyOtpConfigured;
 
   if (jwtWarning) {
     return {
       defaultKdfIterations,
       jwtWarning,
+      yubikeyOtpConfigured,
       session: null,
       profile: null,
       phase: 'login',
@@ -195,6 +207,7 @@ export async function bootstrapAppSession(initial: InitialAppBootstrapState = re
     return {
       defaultKdfIterations,
       jwtWarning: null,
+      yubikeyOtpConfigured,
       session: null,
       profile: null,
       phase: initial.phase,
@@ -206,6 +219,7 @@ export async function bootstrapAppSession(initial: InitialAppBootstrapState = re
     return {
       defaultKdfIterations,
       jwtWarning: null,
+      yubikeyOtpConfigured,
       session: loaded,
       profile: cachedProfile,
       phase: 'locked',
@@ -216,6 +230,7 @@ export async function bootstrapAppSession(initial: InitialAppBootstrapState = re
   return {
     defaultKdfIterations,
     jwtWarning: null,
+    yubikeyOtpConfigured,
     session: loaded,
     profile: null,
     phase: 'locked',
@@ -278,6 +293,14 @@ export async function completeLogin(
   };
 }
 
+function parseTwoFactorProviders(raw: unknown): Array<'0' | '3'> {
+  if (!Array.isArray(raw)) return [];
+  const providers = raw
+    .map((value) => String(value || '').trim())
+    .filter((value): value is '0' | '3' => value === '0' || value === '3');
+  return Array.from(new Set(providers));
+}
+
 export async function performPasswordLogin(
   email: string,
   password: string,
@@ -296,12 +319,16 @@ export async function performPasswordLogin(
 
   const tokenError = token as { TwoFactorProviders?: unknown; error_description?: string; error?: string };
   if (tokenError.TwoFactorProviders) {
+    const availableProviders = parseTwoFactorProviders(tokenError.TwoFactorProviders);
+    const preferredProvider: '0' | '3' = availableProviders.includes('0') ? '0' : '3';
     return {
-      kind: 'totp',
+      kind: 'twoFactor',
       pendingTotp: {
         email: normalizedEmail,
         passwordHash: derived.hash,
         masterKey: derived.masterKey,
+        availableProviders,
+        preferredProvider,
       },
     };
   }
@@ -314,11 +341,13 @@ export async function performPasswordLogin(
 
 export async function performTotpLogin(
   pendingTotp: PendingTotp,
-  totpCode: string,
-  rememberDevice: boolean
+  twoFactorToken: string,
+  rememberDevice: boolean,
+  provider?: '0' | '3'
 ): Promise<CompletedLogin> {
   const token = await loginWithPassword(pendingTotp.email, pendingTotp.passwordHash, {
-    totpCode: totpCode.trim(),
+    twoFactorProvider: provider || pendingTotp.preferredProvider,
+    twoFactorToken: twoFactorToken.trim(),
     rememberDevice,
   });
   if ('access_token' in token && token.access_token) {
@@ -384,4 +413,3 @@ export async function performUnlock(
   }
   return { ...refreshedSession, ...keys };
 }
-
